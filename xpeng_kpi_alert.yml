@@ -1,0 +1,30 @@
+name: XPeng KPI Alert
+
+on:
+  schedule:
+    - cron: "0 12 * * *" # 每天 12:00 UTC（北京 20:00）
+  workflow_dispatch: {}
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas openpyxl numpy
+
+      - name: Run alert
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python xpeng_alert_bot.py "XPeng_Valuation_Monitor_v2.xlsx"
