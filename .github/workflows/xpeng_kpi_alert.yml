@@ -32,13 +32,13 @@ jobs:
           LIVE_PRICE: "1"
           YF_SYMBOL: "9868.HK"
         run: |
-          python xpeng_alert_bot.py "XPeng_Valuation_Monitor_v2.xlsx"
+          python xpeng_alert_bot.py "XPeng_Valuation_Monitor_v3.xlsx"
 
       - name: Commit status & Excel updates
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add status_log.csv XPeng_Valuation_Monitor_v2.xlsx || true
+          git add status_log.csv XPeng_Valuation_Monitor_v3.xlsx || true
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
