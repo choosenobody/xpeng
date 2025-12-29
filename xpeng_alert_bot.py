@@ -311,3 +311,203 @@ def append_logs(xlsx_path, price, base_iv, ok_gm, ok_fcf, ok_ts, ok_rb, ok_rt, k
         "timestamp_utc": ts_utc,
         "price_hkd": round(price, 4) if price==price else "",
         "base_iv_hkd": round(base_iv, 4) if base_iv==base_iv else "",
+        "discount_pct": round(discount, 3) if discount==discount else "",
+        "ok_vehicle_gm": int(ok_gm is True),
+        "ok_fcf": int(ok_fcf is True),
+        "ok_techsvc": int(ok_ts is True),
+        "ok_robotics": int(ok_rb is True),
+        "kpi_pass": int(kpi_pass),
+        "signal": signal,
+        "rating_upgrade": int(rating_up is True)
+    }
+
+    csv_path = "status_log.csv"
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if write_header:
+            w.writeheader()
+        w.writerow(row)
+
+    # 也写回 Excel 的 Status_Log（失败不致命）
+    try:
+        wb = load_workbook(xlsx_path)
+        ws = wb["Status_Log"] if "Status_Log" in wb.sheetnames else wb.create_sheet("Status_Log")
+        if ws.max_row == 1 and ws.cell(1,1).value != "timestamp_utc":
+            ws.append(["timestamp_utc","price_hkd","base_iv_hkd","discount_pct",
+                       "ok_vehicle_gm","ok_fcf","ok_techsvc","ok_robotics",
+                       "kpi_pass","signal","rating_upgrade"])
+        ws.append([ts_utc, price, base_iv, discount,
+                   int(ok_gm is True), int(ok_fcf is True),
+                   int(ok_ts is True), int(ok_rb is True),
+                   int(kpi_pass), signal, int(rating_up is True)])
+        wb.save(xlsx_path)
+    except Exception:
+        pass
+
+# ------------------------- Telegram（稳健：HTML + 失败降级） -------------------------
+
+def _post_telegram(token: str, payload: dict) -> Tuple[bool, str]:
+    import urllib.request, urllib.parse
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = urllib.parse.urlencode(payload).encode("utf-8")
+    try:
+        with urllib.request.urlopen(url, data=data, timeout=20) as r:
+            body = r.read().decode("utf-8", "ignore")
+        return True, body
+    except Exception as e:
+        # Telegram 通常会在 body 里返回具体原因（比如 can't parse entities）
+        try:
+            body = e.read().decode("utf-8", "ignore")  # type: ignore
+        except Exception:
+            body = str(e)
+        return False, body
+
+def strip_telegram_markup(s: str) -> str:
+    return re.sub(r"</?[^>]+>", "", s)
+
+def send_telegram(text: str, parse_mode: Optional[str] = None) -> None:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        print("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID 未配置；仅打印：\n"+text)
+        return
+
+    payload = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+
+    ok, body = _post_telegram(token, payload)
+    if ok:
+        return
+
+    # 失败：降级为纯文本再发一次；仍失败也绝不抛异常
+    print("⚠️ Telegram 发送失败，准备降级重试。返回：", body)
+    payload2 = {"chat_id": chat_id, "text": strip_telegram_markup(text)}
+    ok2, body2 = _post_telegram(token, payload2)
+    if not ok2:
+        print("❌ Telegram 降级发送仍失败：", body2)
+
+# ------------------------- 主流程 -------------------------
+
+def main(xlsx_path: str) -> int:
+    try:
+        ensure_xlsx_ok(xlsx_path)
+    except Exception as e:
+        send_telegram(f"📉 小鹏估值监控：Excel 文件不可用\n\n{e}", parse_mode=None)
+        return 0
+
+    try:
+        A = read_sheet_safe(xlsx_path, "Assumptions")
+        amap = dict(zip(A["Item"], A["Value"]))
+    except Exception as e:
+        send_telegram(f"📉 小鹏估值监控：读取 Assumptions 失败\n\n{e}", parse_mode=None)
+        return 0
+
+    live = os.environ.get("LIVE_PRICE","1") == "1"
+    symbol = os.environ.get("YF_SYMBOL","9868.HK")
+    price_field = os.environ.get("PRICE_FIELD","Close")
+    price_live = fetch_live_price(symbol, price_field) if live else None
+    price = float(price_live) if (price_live is not None) else float(amap.get("Current Price", 0))
+
+    if price_live is not None:
+        try:
+            update_assumptions_price(xlsx_path, price)
+        except Exception as e:
+            send_telegram(f"⚠️ 小鹏估值监控：实时价格写回失败（不影响本次信号计算）\n\n{e}", parse_mode=None)
+
+    base_iv = None
+    try:
+        S = read_sheet_safe(xlsx_path, "Summary")
+        base_row = S[S["Scenario"]=="Base"]
+        base_iv = float(base_row["IV_HKD_per_share"].values[0]) if not base_row.empty else None
+    except Exception:
+        base_iv = None
+    if (base_iv is None) or (base_iv != base_iv):
+        base_iv = dcf_base_iv(xlsx_path)
+
+    try:
+        K = read_sheet_safe(xlsx_path, "KPI_Monitor")
+    except Exception as e:
+        send_telegram(f"📉 小鹏估值监控：读取 KPI_Monitor 失败\n\n{e}", parse_mode=None)
+        return 0
+
+    kd = kpi_details(K, xlsx_path)
+    ok_gm, ok_fcf, ok_rt, kpi_pass = kd["ok_gm"], kd["ok_fcf"], kd["ok_rt"], kd["kpi_pass"]
+
+    signal = "观察"
+    if base_iv and base_iv==base_iv and base_iv > 0:
+        if price <= 0.80 * base_iv:
+            signal = "加仓"
+        elif price <= 0.90 * base_iv:
+            signal = "建仓"
+
+    rating_up = (kpi_pass >= 2) and (ok_rt is True)
+
+    append_logs(
+        xlsx_path, price, base_iv,
+        kd["ok_gm"], kd["ok_fcf"], kd["ok_ts"], kd["ok_rb"], kd["ok_rt"],
+        kpi_pass, signal, rating_up
+    )
+
+    # --- HTML 消息（稳） ---
+    import html
+    ts_utc = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    sym_esc = html.escape(symbol)
+
+    if base_iv and base_iv==base_iv and base_iv > 0:
+        premium_pct = (price / base_iv - 1.0) * 100
+        iv_line = f"基准内在价值: HK${base_iv:.2f} | 溢价: {premium_pct:+.1f}%"
+    else:
+        iv_line = "基准内在价值: N/A"
+
+    def esc(s: str) -> str:
+        return html.escape(s)
+
+    lines = []
+    lines.append("<b>小鹏估值监控</b>")
+    lines.append(esc(f"时间: {ts_utc}"))
+    lines.append(f"代码: <code>{sym_esc}</code> | 现价: {esc(f'HK${price:.2f}')}")
+    lines.append(esc(iv_line))
+    lines.append(esc(f"信号: {signal} | KPI通过数: {kpi_pass}/3 | 评级建议: {'上调' if rating_up else '暂不升级'}"))
+    lines.append("")
+    lines.append("<b>KPI 明细（最新值 vs 阈值 → 结论）</b>")
+
+    if kd["ok_gm"] is None:
+        lines.append(esc(f"- 整车毛利率(%): NA（{kd['gm_reason']}）"))
+    else:
+        lines.append(esc(f"- 整车毛利率(%): {_fmt(kd['gm_latest'])} vs ≥{_fmt(kd['gm_target'])} → {_pf(kd['ok_gm'])}"))
+
+    if kd["ok_fcf"] is None:
+        lines.append(esc(f"- 自由现金流TTM(十亿港币): NA（{kd['fcf_reason']}）"))
+    else:
+        lines.append(esc(f"- 自由现金流TTM(十亿港币): {_fmt(kd['fcf_latest'])} vs ≥{_fmt(kd['fcf_target'])} → {_pf(kd['ok_fcf'])}"))
+
+    if kd["ok_ts"] is None:
+        lines.append(esc(f"- 科技/服务收入占比(%): NA（{kd['ts_reason']}）"))
+    else:
+        lines.append(esc(f"- 科技/服务收入占比(%): {_fmt(kd['ts_latest'])} vs ≥{_fmt(kd['ts_target'])} → {_pf(kd['ok_ts'])}"))
+
+    if kd["ok_rb"] is None:
+        lines.append(esc(f"- 机器人收入占比(%): NA（{kd['rb_reason']}；可设置 ROBOTICS_LATEST=xx 补齐）"))
+    else:
+        src = "（来自环境变量）" if kd.get("rb_source") == "env" else ""
+        lines.append(esc(f"- 机器人收入占比(%): {_fmt(kd['rb_latest'])} vs ≥{_fmt(kd['rb_target'])} → {_pf(kd['ok_rb'])} {src}"))
+
+    rt_line = "NA（科技/服务 与 机器人 均缺失）" if kd["ok_rt"] is None else _pf(kd["ok_rt"])
+    lines.append(esc(f"- 机器人/科技服务综合（任一PASS即PASS）：{rt_line}"))
+
+    mode = os.environ.get("TELEGRAM_PARSE_MODE", "HTML").strip() or None
+    send_telegram("\n".join(lines), parse_mode=mode)
+    return 0
+
+if __name__=="__main__":
+    if len(sys.argv)<2:
+        print("Usage: python xpeng_alert_bot.py XPeng_Valuation_Monitor_v2.xlsx")
+        sys.exit(1)
+    # 任何情况下都不要让 CI 因推送失败 exit 1
+    try:
+        sys.exit(main(sys.argv[1]) or 0)
+    except Exception as e:
+        print("❌ 脚本出现未捕获异常（已吞掉，避免 CI 失败）：", e)
+        sys.exit(0)
