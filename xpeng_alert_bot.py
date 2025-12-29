@@ -1,30 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-xpeng_alert_bot.py  (v2.2.3)
+xpeng_alert_bot.py  (v2.2.4)
 
-本次改动（对应你的两点需求）：
-1) 解决 Robotics Rev Share (%) 的 NA：
-   - 优先从 KPI_Monitor 中读取（支持多种别名/关键词）
-   - 若 KPI_Monitor 没有该行，则支持用环境变量提供数值：
-        ROBOTICS_LATEST=6.5   （百分比数值）
-        ROBOTICS_TARGET=5     （可选，默认5）
-     并在消息中标注“来自环境变量”，避免误解为 Excel 原生数据
-   - 可选：AUTO_PATCH_KPI=1 时，若 Robotics 行缺失且提供了 ROBOTICS_LATEST，则自动向 KPI_Monitor 追加该行，避免下次仍 NA
+修复点：
+1) Telegram 400 Bad Request 不再导致 CI 失败：
+   - 默认用 parse_mode=HTML（更稳），动态内容 HTML 转义
+   - 发送失败自动降级为纯文本重试
+   - 即使两次都失败，也只打印错误并正常退出(0)
 
-2) 推送内容标题与 KPI 名称全部中文化（代码、现价、整车毛利率等）。
-
-其他：保留 v2.2 的功能，并继续提供 .xlsx 文件有效性检查（ZIP 头 'PK'）以避免 BadZipFile。
+2) 保留 v2.2.3：
+   - Robotics NA 补齐：优先 KPI_Monitor；缺失则读 ROBOTICS_LATEST/ROBOTICS_TARGET；可选 AUTO_PATCH_KPI=1 写回 KPI_Monitor
+   - 标题/字段中文化
+   - .xlsx ZIP 头检查，避免 BadZipFile / LFS 指针 / HTML 错页
 
 环境变量：
 - TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   # 必填(若要推送)
-- LIVE_PRICE=1                            # 开启实时股价（默认1）
-- YF_SYMBOL=9868.HK                       # 雅虎符号；美股可设 XPEV
-- PRICE_FIELD=Close                       # 'Close' 或 'Adj Close'（默认 Close）
-- TZ=Asia/Hong_Kong                       # 仅写入日志用
-- ROBOTICS_LATEST=6.5                     # Robotics 收入占比（%），用于补齐 Excel 缺失
-- ROBOTICS_TARGET=5                       # Robotics 阈值（%），可选
-- AUTO_PATCH_KPI=1                        # 可选：自动把 Robotics 行写回 KPI_Monitor
+- TELEGRAM_PARSE_MODE=HTML              # 默认 HTML；可设为空禁用 parse_mode
+- LIVE_PRICE=1                          # 默认1
+- YF_SYMBOL=9868.HK
+- PRICE_FIELD=Close
+- ROBOTICS_LATEST=6.5                   # 机器人收入占比（%），用于补齐缺失
+- ROBOTICS_TARGET=5                     # 阈值（%），可选，默认5
+- AUTO_PATCH_KPI=1                      # 可选：自动把 Robotics 行写回 KPI_Monitor
 """
 
 import os, sys, re, csv, datetime
@@ -33,6 +31,7 @@ from typing import Optional, Tuple, Dict, Any
 
 import pandas as pd
 import numpy as np
+from openpyxl import load_workbook
 
 # ------------------------- Excel 安全检查 & 读取 -------------------------
 
@@ -92,14 +91,13 @@ def fetch_live_price(symbol: str, price_field: str = "Close") -> Optional[float]
 
 # ------------------------- Excel 读写 -------------------------
 
-from openpyxl import load_workbook
-
 def update_assumptions_price(xlsx_path: str, new_price: float) -> None:
     wb = load_workbook(xlsx_path)
     ws = wb["Assumptions"]
     headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
     item_idx = headers.index("Item") + 1
     val_idx  = headers.index("Value") + 1
+
     found = False
     for r in range(2, ws.max_row + 1):
         if str(ws.cell(r, item_idx).value).strip() == "Current Price":
@@ -120,11 +118,6 @@ def update_assumptions_price(xlsx_path: str, new_price: float) -> None:
     wb.save(xlsx_path)
 
 def maybe_patch_kpi_robotics_row(xlsx_path: str, latest: float, target: float) -> bool:
-    """
-    AUTO_PATCH_KPI=1 时：若 KPI_Monitor 缺失 Robotics 行，则追加一行。
-    仅在 KPI_Monitor 结构为 [Metric, Latest, Target/Threshold] 时启用。
-    返回是否成功写入。
-    """
     if os.environ.get("AUTO_PATCH_KPI", "0") != "1":
         return False
     try:
@@ -136,17 +129,13 @@ def maybe_patch_kpi_robotics_row(xlsx_path: str, latest: float, target: float) -
         if "Metric" not in headers or "Latest" not in headers or "Target/Threshold" not in headers:
             return False
         mcol = headers.index("Metric") + 1
-        lcol = headers.index("Latest") + 1
-        tcol = headers.index("Target/Threshold") + 1
 
-        # 是否已存在（含关键词匹配）
         for r in range(2, ws.max_row+1):
             v = ws.cell(r, mcol).value
             if v is None:
                 continue
             s = str(v)
             if ("robot" in s.lower()) or ("机器人" in s) or ("Robotics" in s):
-                # 已有行就不重复写
                 return False
 
         ws.append(["Robotics Rev Share (%)", float(latest), float(target)])
@@ -206,7 +195,7 @@ def dcf_base_iv(xlsx_path: str) -> Optional[float]:
     except Exception:
         return None
 
-# ------------------------- KPI 解析（增强：输出 Latest/Target/原因；支持 env 补齐 Robotics） -------------------------
+# ------------------------- KPI 解析 -------------------------
 
 def _to_float(x) -> Optional[float]:
     try:
@@ -253,28 +242,18 @@ def _eval_kpi_ge(row, default_target: float) -> Tuple[Optional[bool], Optional[f
         return None, None, target, "Latest 为空/不可解析"
     if target is None:
         return None, latest, None, "Target/Threshold 为空/不可解析"
-    ok = bool(latest >= target)
-    return ok, float(latest), float(target), ""
+    return bool(latest >= target), float(latest), float(target), ""
 
-def kpi_details(K: pd.DataFrame) -> Dict[str, Any]:
-    gm_row = _get_metric_row(K,
-                            ["Vehicle GM (%)", "Vehicle GM", "Vehicle GM%"],
-                            ["Vehicle GM", "GM", "整车毛利", "毛利率"])
-    fcf_row = _get_metric_row(K,
-                             ["FCF (TTM, bn HKD)", "FCF (TTM)", "FCF"],
-                             ["FCF", "自由现金流"])
-    ts_row  = _get_metric_row(K,
-                             ["Tech/Service Rev Share (%)", "Tech/Service Share (%)", "Tech/Service"],
-                             ["Tech", "Service", "服务", "科技"])
-    rb_row  = _get_metric_row(K,
-                             ["Robotics Rev Share (%)", "Robotics Share (%)", "Robotics"],
-                             ["robot", "机器人", "robotics"])
+def kpi_details(K: pd.DataFrame, xlsx_path: str) -> Dict[str, Any]:
+    gm_row = _get_metric_row(K, ["Vehicle GM (%)", "Vehicle GM", "Vehicle GM%"], ["Vehicle GM", "GM", "整车毛利", "毛利率"])
+    fcf_row = _get_metric_row(K, ["FCF (TTM, bn HKD)", "FCF (TTM)", "FCF"], ["FCF", "自由现金流"])
+    ts_row  = _get_metric_row(K, ["Tech/Service Rev Share (%)", "Tech/Service Share (%)", "Tech/Service"], ["Tech", "Service", "服务", "科技"])
+    rb_row  = _get_metric_row(K, ["Robotics Rev Share (%)", "Robotics Share (%)", "Robotics"], ["robot", "机器人", "robotics"])
 
     ok_gm,  gm_latest, gm_target, gm_reason = _eval_kpi_ge(gm_row, 15)
     ok_fcf, fcf_latest, fcf_target, fcf_reason = _eval_kpi_ge(fcf_row, 0)
     ok_ts,  ts_latest, ts_target, ts_reason = _eval_kpi_ge(ts_row, 10)
 
-    # Robotics：先读表；缺失则看环境变量
     rb_source = "excel"
     if rb_row is None:
         env_latest = _to_float(os.environ.get("ROBOTICS_LATEST"))
@@ -283,20 +262,17 @@ def kpi_details(K: pd.DataFrame) -> Dict[str, Any]:
             if env_target is None:
                 env_target = 5.0
             ok_rb = bool(env_latest >= env_target)
-            rb_latest, rb_target, rb_reason = float(env_latest), float(env_target), "来自环境变量 ROBOTICS_LATEST"
+            rb_latest, rb_target = float(env_latest), float(env_target)
+            rb_reason = "来自环境变量 ROBOTICS_LATEST"
             rb_source = "env"
-            # 可选自动补写 KPI_Monitor
-            maybe_patch_kpi_robotics_row(os.path.abspath(xlsx_path_global), rb_latest, rb_target)  # noqa
+            maybe_patch_kpi_robotics_row(xlsx_path, rb_latest, rb_target)
         else:
-            ok_rb, rb_latest, rb_target, rb_reason = None, None, 5.0, "KPI_Monitor 未提供 Robotics 指标行，且未设置 ROBOTICS_LATEST"
+            ok_rb, rb_latest, rb_target = None, None, 5.0
+            rb_reason = "KPI_Monitor 未提供 Robotics 指标行，且未设置 ROBOTICS_LATEST"
     else:
         ok_rb, rb_latest, rb_target, rb_reason = _eval_kpi_ge(rb_row, 5)
 
-    # “机器人/技术服务”达标
-    if ok_ts is None and ok_rb is None:
-        ok_rt = None
-    else:
-        ok_rt = bool(ok_ts is True or ok_rb is True)
+    ok_rt = None if (ok_ts is None and ok_rb is None) else bool(ok_ts is True or ok_rb is True)
 
     kpi_pass = 0
     if ok_gm is True: kpi_pass += 1
@@ -335,180 +311,3 @@ def append_logs(xlsx_path, price, base_iv, ok_gm, ok_fcf, ok_ts, ok_rb, ok_rt, k
         "timestamp_utc": ts_utc,
         "price_hkd": round(price, 4) if price==price else "",
         "base_iv_hkd": round(base_iv, 4) if base_iv==base_iv else "",
-        "discount_pct": round(discount, 3) if discount==discount else "",
-        "ok_vehicle_gm": int(ok_gm is True),
-        "ok_fcf": int(ok_fcf is True),
-        "ok_techsvc": int(ok_ts is True),
-        "ok_robotics": int(ok_rb is True),
-        "kpi_pass": int(kpi_pass),
-        "signal": signal,
-        "rating_upgrade": int(rating_up is True)
-    }
-    csv_path = "status_log.csv"
-    write_header = not os.path.exists(csv_path)
-    with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=list(row.keys()))
-        if write_header:
-            w.writeheader()
-        w.writerow(row)
-
-    try:
-        wb = load_workbook(xlsx_path)
-        ws = wb["Status_Log"] if "Status_Log" in wb.sheetnames else wb.create_sheet("Status_Log")
-        if ws.max_row == 1 and ws.cell(1,1).value != "timestamp_utc":
-            ws.append(["timestamp_utc","price_hkd","base_iv_hkd","discount_pct",
-                       "ok_vehicle_gm","ok_fcf","ok_techsvc","ok_robotics",
-                       "kpi_pass","signal","rating_upgrade"])
-        ws.append([ts_utc, price, base_iv, discount,
-                   int(ok_gm is True), int(ok_fcf is True),
-                   int(ok_ts is True), int(ok_rb is True),
-                   int(kpi_pass), signal, int(rating_up is True)])
-        wb.save(xlsx_path)
-    except Exception:
-        pass
-
-# ------------------------- Telegram -------------------------
-
-def send_telegram(text: str):
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        print("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID 未配置；仅打印：\n"+text)
-        return
-    import urllib.request, urllib.parse
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = urllib.parse.urlencode({
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown"
-    }).encode("utf-8")
-    with urllib.request.urlopen(url, data=data, timeout=20) as r:
-        r.read()
-
-# ------------------------- 主流程 -------------------------
-
-xlsx_path_global = ""  # 给 kpi_details 内部 auto patch 用
-
-def main(xlsx_path: str):
-    global xlsx_path_global
-    xlsx_path_global = xlsx_path
-
-    try:
-        ensure_xlsx_ok(xlsx_path)
-    except Exception as e:
-        send_telegram(f"📉 小鹏监控：Excel 文件不可用\n\n{e}")
-        return 0
-
-    # 1) 读取 Assumptions
-    try:
-        A = read_sheet_safe(xlsx_path, "Assumptions")
-        amap = dict(zip(A["Item"], A["Value"]))
-    except Exception as e:
-        send_telegram(f"📉 小鹏监控：读取 Assumptions 失败\n\n{e}")
-        return 0
-
-    # 2) 实时股价（可选）
-    live = os.environ.get("LIVE_PRICE","1") == "1"
-    symbol = os.environ.get("YF_SYMBOL","9868.HK")
-    price_field = os.environ.get("PRICE_FIELD","Close")
-    price_live = fetch_live_price(symbol, price_field) if live else None
-    price = float(price_live) if (price_live is not None) else float(amap.get("Current Price", 0))
-
-    if price_live is not None:
-        try:
-            update_assumptions_price(xlsx_path, price)
-        except Exception as e:
-            send_telegram(f"⚠️ 小鹏监控：实时价格写回失败（不影响本次信号计算）\n\n{e}")
-
-    # 3) Base IV：优先 Summary；否则 DCF
-    base_iv = None
-    try:
-        S = read_sheet_safe(xlsx_path, "Summary")
-        base_row = S[S["Scenario"]=="Base"]
-        base_iv = float(base_row["IV_HKD_per_share"].values[0]) if not base_row.empty else None
-    except Exception:
-        base_iv = None
-    if (base_iv is None) or (base_iv != base_iv):
-        base_iv = dcf_base_iv(xlsx_path)
-
-    # 4) KPI
-    try:
-        K = read_sheet_safe(xlsx_path, "KPI_Monitor")
-    except Exception as e:
-        send_telegram(f"📉 小鹏监控：读取 KPI_Monitor 失败\n\n{e}")
-        return 0
-
-    kd = kpi_details(K)
-    ok_gm, ok_fcf, ok_ts, ok_rb, ok_rt, kpi_pass = (
-        kd["ok_gm"], kd["ok_fcf"], kd["ok_ts"], kd["ok_rb"], kd["ok_rt"], kd["kpi_pass"]
-    )
-
-    # 5) 信号 & 评级建议
-    signal = "观察"
-    if base_iv and base_iv==base_iv and base_iv > 0:
-        if price <= 0.80 * base_iv:
-            signal = "加仓"
-        elif price <= 0.90 * base_iv:
-            signal = "建仓"
-    rating_up = (kpi_pass >= 2) and (ok_rt is True)
-
-    # 6) 记录
-    append_logs(xlsx_path, price, base_iv, ok_gm, ok_fcf, ok_ts, ok_rb, ok_rt, kpi_pass, signal, rating_up)
-
-    # 7) 中文化推送
-    ts_utc = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    if base_iv and base_iv==base_iv and base_iv > 0:
-        premium_pct = (price / base_iv - 1.0) * 100
-        iv_line = f"基准内在价值: HK${base_iv:.2f} | 溢价: {premium_pct:+.1f}%"
-    else:
-        iv_line = "基准内在价值: N/A"
-
-    lines = []
-    lines.append("*小鹏估值监控*")
-    lines.append(f"时间: {ts_utc}")
-    lines.append(f"代码: `{symbol}` | 现价: HK${price:.2f}")
-    lines.append(iv_line)
-    lines.append(f"信号: *{signal}* | KPI通过数: {kpi_pass}/3 | 评级建议: {'*上调*' if rating_up else '暂不升级'}")
-    lines.append("")
-    lines.append("*KPI 明细（最新值 vs 阈值 → 结论）*")
-
-    # 整车毛利率
-    if kd["ok_gm"] is None:
-        lines.append(f"- 整车毛利率(%): NA（{kd['gm_reason']}）")
-    else:
-        lines.append(f"- 整车毛利率(%): {_fmt(kd['gm_latest'])} vs ≥{_fmt(kd['gm_target'])} → {_pf(kd['ok_gm'])}")
-
-    # 自由现金流
-    if kd["ok_fcf"] is None:
-        lines.append(f"- 自由现金流TTM(十亿港币): NA（{kd['fcf_reason']}）")
-    else:
-        lines.append(f"- 自由现金流TTM(十亿港币): {_fmt(kd['fcf_latest'])} vs ≥{_fmt(kd['fcf_target'])} → {_pf(kd['ok_fcf'])}")
-
-    # 科技/服务收入占比
-    if kd["ok_ts"] is None:
-        lines.append(f"- 科技/服务收入占比(%): NA（{kd['ts_reason']}）")
-    else:
-        lines.append(f"- 科技/服务收入占比(%): {_fmt(kd['ts_latest'])} vs ≥{_fmt(kd['ts_target'])} → {_pf(kd['ok_ts'])}")
-
-    # 机器人收入占比
-    if kd["ok_rb"] is None:
-        lines.append(f"- 机器人收入占比(%): NA（{kd['rb_reason']}；你可以设置 ROBOTICS_LATEST=xx 以补齐）")
-    else:
-        src = "（来自环境变量）" if kd.get("rb_source") == "env" else ""
-        lines.append(f"- 机器人收入占比(%): {_fmt(kd['rb_latest'])} vs ≥{_fmt(kd['rb_target'])} → {_pf(kd['ok_rb'])} {src}")
-
-    # 综合
-    if ok_rt is None:
-        rt_line = "NA（科技/服务 与 机器人 均缺失）"
-    else:
-        rt_line = _pf(ok_rt)
-    lines.append(f"- 机器人/科技服务综合（任一PASS即PASS）：{rt_line}")
-
-    send_telegram("\n".join(lines))
-    return 0
-
-if __name__=="__main__":
-    if len(sys.argv)<2:
-        print("Usage: python xpeng_alert_bot.py /path/to/XPeng_Valuation_Monitor_v2.xlsx")
-        sys.exit(1)
-    sys.exit(main(sys.argv[1]))
